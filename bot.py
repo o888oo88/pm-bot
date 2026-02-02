@@ -1,4 +1,4 @@
-iimport os
+import os
 import re
 import asyncio
 import logging
@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================= НАСТРОЙКИ =================
 
-BOT_TOKEN = os.getenv("8273670933:AAHxaLl92JcNm9nfDd2mOlMA8DEMLBiCQpo", "")  # <-- задай в окружении
+BOT_TOKEN = "8273670933:AAHxaLl92JcNm9nfDd2mOlMA8DEMLBiCQpo"
 POLL_INTERVAL_SEC = 2
 
 DATA_API = "https://data-api.polymarket.com/activity"
@@ -309,7 +309,7 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
         with conn:
             conn.execute(
                 "UPDATE watches SET last_seen_ts=? WHERE chat_id=? AND address=?",
-                (max_ts_all, chat_id, addr),
+                (max_ts_all, chat_id, addr)
             )
 
     conn.close()
@@ -318,7 +318,7 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ Укажи BOT_TOKEN в переменной окружения (export BOT_TOKEN=...)")
+        raise SystemExit("❌ Укажи BOT_TOKEN в переменной окружения (export BOT_TOKEN=8273670933:AAHxaLl92JcNm9nfDd2mOlMA8DEMLBiCQpo)")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
