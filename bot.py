@@ -1,4 +1,4 @@
-import os
+iimport os
 import re
 import asyncio
 import logging
@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================= НАСТРОЙКИ =================
 
-BOT_TOKEN = "8273670933:AAHxaLl92JcNm9nfDd2mOlMA8DEMLBiCQpo"
+BOT_TOKEN = os.getenv("8273670933:AAHxaLl92JcNm9nfDd2mOlMA8DEMLBiCQpo", "")  # <-- задай в окружении
 POLL_INTERVAL_SEC = 2
 
 DATA_API = "https://data-api.polymarket.com/activity"
@@ -33,11 +33,43 @@ def db():
             PRIMARY KEY (chat_id, address)
         )
     """)
+    # настройки на чат: порог суммы в USDC
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_settings (
+            chat_id INTEGER PRIMARY KEY,
+            min_usdc REAL NOT NULL DEFAULT 0
+        )
+    """)
     return conn
 
 
 def normalize(addr: str) -> str:
     return addr.lower().strip()
+
+
+def parse_amount(s: str) -> float:
+    """
+    /min 10_000
+    /min 10,000
+    /min 10000
+    """
+    s = s.strip().replace("_", "").replace(",", "")
+    return float(s)
+
+
+def get_min_usdc(conn, chat_id: int) -> float:
+    cur = conn.execute("SELECT min_usdc FROM chat_settings WHERE chat_id=?", (chat_id,))
+    row = cur.fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def set_min_usdc(conn, chat_id: int, value: float):
+    with conn:
+        conn.execute(
+            "INSERT INTO chat_settings(chat_id, min_usdc) VALUES(?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET min_usdc=excluded.min_usdc",
+            (chat_id, value),
+        )
 
 # ================= POLYMARKET API =================
 
@@ -80,8 +112,11 @@ def format_trade(t: dict) -> str:
     ]
 
     if usdc is not None:
-        usdc = round(float(usdc), 2)
-        lines.append(f"💵 *Сумма:* {usdc} USDC")
+        try:
+            usdc_val = round(float(usdc), 2)
+            lines.append(f"💵 *Сумма:* {usdc_val} USDC")
+        except Exception:
+            pass
 
     if price is not None:
         lines.append(f"🏷 *Цена:* {price}")
@@ -97,12 +132,22 @@ def format_trade(t: dict) -> str:
 # ================= TELEGRAM COMMANDS =================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    conn = db()
+    try:
+        min_usdc = get_min_usdc(conn, chat_id)
+    finally:
+        conn.close()
+
     await update.message.reply_text(
         "🤖 Polymarket Signal Bot\n\n"
         "Команды:\n"
         "/watch 0x...  — начать отслеживание\n"
         "/unwatch 0x... — убрать адрес\n"
         "/list — список адресов\n"
+        "/min <сумма> — минимальная сумма сделки для алерта (USDC)\n\n"
+        f"Текущий порог: {min_usdc} USDC\n"
+        "Пример: /min 10000"
     )
 
 
@@ -128,7 +173,7 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO watches(chat_id, address, last_seen_ts) VALUES(?,?,?)",
-            (chat_id, addr, last_seen_ts)
+            (chat_id, addr, last_seen_ts),
         )
     conn.close()
 
@@ -146,7 +191,7 @@ async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with conn:
         cur = conn.execute(
             "DELETE FROM watches WHERE chat_id=? AND address=?",
-            (chat_id, addr)
+            (chat_id, addr),
         )
         deleted = cur.rowcount
     conn.close()
@@ -163,21 +208,56 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     cur = conn.execute(
         "SELECT address FROM watches WHERE chat_id=? ORDER BY address",
-        (chat_id,)
+        (chat_id,),
     )
     rows = cur.fetchall()
+    min_usdc = get_min_usdc(conn, chat_id)
     conn.close()
 
     if not rows:
-        return await update.message.reply_text("Список пуст.")
+        return await update.message.reply_text(
+            f"Список пуст.\nТекущий порог: {min_usdc} USDC"
+        )
 
-    msg = ["📌 Отслеживаемые адреса:"]
+    msg = [f"📌 Отслеживаемые адреса (порог {min_usdc} USDC):"]
     for (addr,) in rows:
         msg.append(f"• {addr}")
 
     await update.message.reply_text("\n".join(msg))
 
+
+async def cmd_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    conn = db()
+    try:
+        if not context.args:
+            current = get_min_usdc(conn, chat_id)
+            return await update.message.reply_text(
+                f"🎛 Текущий порог: {current} USDC\n"
+                "Установить: /min 10000\n"
+                "Сбросить: /min 0"
+            )
+
+        try:
+            value = parse_amount(context.args[0])
+            if value < 0:
+                raise ValueError("negative")
+        except Exception:
+            return await update.message.reply_text("❌ Пример: /min 10000 (или /min 0 для сброса)")
+
+        set_min_usdc(conn, chat_id, float(value))
+        await update.message.reply_text(f"✅ Порог установлен: {float(value)} USDC")
+    finally:
+        conn.close()
+
 # ================= POLLING JOB =================
+
+def trade_usdc(t: dict) -> float:
+    try:
+        return float(t.get("usdcSize") or 0)
+    except Exception:
+        return 0.0
+
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     conn = db()
@@ -185,6 +265,9 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     watches = cur.fetchall()
 
     for chat_id, addr, last_ts in watches:
+        # порог для этого чата
+        min_usdc = get_min_usdc(conn, chat_id)
+
         try:
             trades = fetch_latest_trades(addr)
         except RuntimeError as e:
@@ -197,30 +280,36 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
             log.warning("Fetch error: %s", e)
             continue
 
-        new_items = [
+        # все новые сделки (для обновления last_seen_ts)
+        new_all = [
             t for t in trades
             if int(t.get("timestamp") or 0) > int(last_ts)
         ]
 
-        if not new_items:
+        if not new_all:
             continue
 
-        new_items.sort(key=lambda x: int(x.get("timestamp") or 0))
-        max_ts = int(last_ts)
+        # обновим last_seen_ts по всем новым, даже если не алертим
+        max_ts_all = max(int(t.get("timestamp") or 0) for t in new_all)
 
-        for t in new_items:
-            text = f"👤 `{addr}`\n" + format_trade(t)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode="Markdown"
-            )
-            max_ts = max(max_ts, int(t.get("timestamp") or 0))
+        # фильтр по сумме (для алерта)
+        new_alerts = [t for t in new_all if trade_usdc(t) >= float(min_usdc)]
 
+        if new_alerts:
+            new_alerts.sort(key=lambda x: int(x.get("timestamp") or 0))
+            for t in new_alerts:
+                text = f"👤 `{addr}`\n" + format_trade(t)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="Markdown"
+                )
+
+        # важно: сохраняем max_ts_all, чтобы не повторять мелкие сделки каждый цикл
         with conn:
             conn.execute(
                 "UPDATE watches SET last_seen_ts=? WHERE chat_id=? AND address=?",
-                (max_ts, chat_id, addr)
+                (max_ts_all, chat_id, addr),
             )
 
     conn.close()
@@ -229,7 +318,7 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("❌ Укажи BOT_TOKEN в переменной окружения")
+        raise SystemExit("❌ Укажи BOT_TOKEN в переменной окружения (export BOT_TOKEN=...)")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -237,12 +326,12 @@ def main():
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("unwatch", cmd_unwatch))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("min", cmd_min))
 
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL_SEC, first=3)
 
     log.info("Bot started")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
