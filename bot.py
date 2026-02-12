@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sqlite3
 import requests
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -13,7 +14,9 @@ BOT_TOKEN = "8273670933:AAHxaLl92JcNm9nfDd2mOlMA8DEMLBiCQpo"
 POLL_INTERVAL_SEC = 2
 
 DATA_API = "https://data-api.polymarket.com/activity"
-DB_PATH = "watch.db"
+
+BASE_DIR = Path(__file__).parent
+DB_PATH = BASE_DIR / "watch.db"
 
 ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
@@ -22,8 +25,8 @@ log = logging.getLogger("pm-bot")
 
 # ================= БАЗА =================
 
-def ensure_schema(conn: sqlite3.Connection):
-    # базовая таблица
+def db():
+    conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS watches (
             chat_id INTEGER NOT NULL,
@@ -33,16 +36,6 @@ def ensure_schema(conn: sqlite3.Connection):
             PRIMARY KEY (chat_id, address)
         )
     """)
-
-    # миграция для старых БД (если вдруг таблица была без min_usdc)
-    cols = [row[1] for row in conn.execute("PRAGMA table_info(watches)").fetchall()]
-    if "min_usdc" not in cols:
-        conn.execute("ALTER TABLE watches ADD COLUMN min_usdc REAL NOT NULL DEFAULT 0")
-
-
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    ensure_schema(conn)
     return conn
 
 
@@ -51,283 +44,187 @@ def normalize(addr: str) -> str:
 
 
 def parse_amount(s: str) -> float:
-    # поддержка 10_000 и 10,000
-    s = s.strip().replace("_", "").replace(",", "")
-    return float(s)
+    return float(s.replace("_", "").replace(",", ""))
 
 
 def trade_usdc(t: dict) -> float:
     try:
         return float(t.get("usdcSize") or 0)
-    except Exception:
+    except:
         return 0.0
 
-# ================= POLYMARKET API =================
+# ================= POLYMARKET =================
 
 def fetch_latest_trades(address: str, limit: int = 30):
-    params = {
+    r = requests.get(DATA_API, params={
         "user": address,
         "type": "TRADE",
         "limit": limit,
         "offset": 0,
         "sortBy": "TIMESTAMP",
         "sortDirection": "DESC",
-    }
-
-    r = requests.get(DATA_API, params=params, timeout=15)
-
-    if r.status_code == 429:
-        retry_after = int(r.headers.get("Retry-After", "2"))
-        raise RuntimeError(f"RATE_LIMIT:{retry_after}")
+    }, timeout=15)
 
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, list) else []
 
-# ================= ФОРМАТ СИГНАЛА =================
+
+def polymarket_url(t: dict):
+    e = t.get("eventSlug")
+    m = t.get("slug")
+    if e and m:
+        return f"https://polymarket.com/event/{e}/{m}"
+    if e:
+        return f"https://polymarket.com/event/{e}"
+    return None
+
+# ================= FORMAT =================
 
 def format_trade(t: dict) -> str:
     title = t.get("title") or "(без названия)"
     side = t.get("side") or "TRADE"
-    outcome = t.get("outcome") or "(не указан)"
-    price = t.get("price")
+    outcome = t.get("outcome") or "-"
     usdc = t.get("usdcSize")
-    size = t.get("size")
-    tx = t.get("transactionHash")
 
-    lines = [
-        "🧾 *Новая сделка*",
-        f"📌 *Событие:* {title}",
-        f"🎯 *Куда ставка:* {outcome}",
-        f"🧭 *Действие:* {side}",
+    msg = [
+        "🧾 *Сделка*",
+        f"📌 {title}",
+        f"🎯 {outcome}",
+        f"🧭 {side}",
     ]
 
-    if usdc is not None:
+    if usdc:
         try:
-            usdc_val = round(float(usdc), 2)
-            lines.append(f"💵 *Сумма:* {usdc_val} USDC")
-        except Exception:
+            msg.append(f"💵 {round(float(usdc),2)} USDC")
+        except:
             pass
 
-    if price is not None:
-        lines.append(f"🏷 *Цена:* {price}")
+    url = polymarket_url(t)
+    if url:
+        msg.append(f"🌐 [Открыть событие]({url})")
 
-    if size is not None:
-        lines.append(f"📦 *Size:* {size}")
+    return "\n".join(msg)
 
-    if tx:
-        lines.append(f"🔗 *Tx:* `{tx}`")
-
-    return "\n".join(lines)
-
-# ================= TELEGRAM COMMANDS =================
+# ================= COMMANDS =================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Polymarket Signal Bot\n\n"
         "Команды:\n"
-        "/watch 0x...          — начать отслеживание адреса\n"
-        "/unwatch 0x...        — убрать адрес\n"
-        "/list                — список адресов + пороги\n"
-        "/min 0x... 10000      — порог алертов для адреса (USDC)\n\n"
-        "Пример:\n"
-        "/watch 0x1234...\n"
-        "/min 0x1234... 10000"
+        "/watch 0x...\n"
+        "/min 0x... 10000\n"
+        "/list"
     )
 
 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Пример: /watch 0x1234...")
-
     addr = normalize(context.args[0])
-    if not ADDR_RE.match(addr):
-        return await update.message.reply_text("❌ Неверный формат адреса.")
-
     chat_id = update.effective_chat.id
 
-    # чтобы не спамить старыми — ставим last_seen на последний трейд
     last_seen_ts = 0
     try:
-        trades = fetch_latest_trades(addr, limit=1)
-        if trades:
-            last_seen_ts = int(trades[0].get("timestamp") or 0)
-    except Exception:
+        t = fetch_latest_trades(addr,1)
+        if t:
+            last_seen_ts = int(t[0].get("timestamp") or 0)
+    except:
         pass
 
     conn = db()
     with conn:
-        # если уже был адрес — сохраняем существующий min_usdc, иначе 0
-        cur = conn.execute(
-            "SELECT min_usdc FROM watches WHERE chat_id=? AND address=?",
-            (chat_id, addr)
-        )
-        row = cur.fetchone()
-        min_usdc = float(row[0]) if row else 0.0
-
         conn.execute(
-            "INSERT OR REPLACE INTO watches(chat_id, address, last_seen_ts, min_usdc) VALUES(?,?,?,?)",
-            (chat_id, addr, last_seen_ts, min_usdc)
+            "INSERT OR REPLACE INTO watches VALUES(?,?,?,COALESCE((SELECT min_usdc FROM watches WHERE chat_id=? AND address=?),0))",
+            (chat_id, addr, last_seen_ts, chat_id, addr)
         )
     conn.close()
 
-    await update.message.reply_text(
-        f"✅ Начал следить за {addr}\n"
-        f"Порог: {min_usdc} USDC\n"
-        f"Установить: /min {addr} 10000"
-    )
+    await update.message.reply_text("Добавлен")
 
 
-async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Пример: /unwatch 0x1234...")
-
+async def cmd_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = normalize(context.args[0])
+    val = parse_amount(context.args[1])
     chat_id = update.effective_chat.id
 
     conn = db()
     with conn:
-        cur = conn.execute(
-            "DELETE FROM watches WHERE chat_id=? AND address=?",
-            (chat_id, addr)
+        conn.execute(
+            "UPDATE watches SET min_usdc=? WHERE chat_id=? AND address=?",
+            (val,chat_id,addr)
         )
-        deleted = cur.rowcount
     conn.close()
 
-    if deleted:
-        await update.message.reply_text(f"🛑 Убрал {addr}")
-    else:
-        await update.message.reply_text("Адрес не найден.")
+    await update.message.reply_text("Порог обновлён")
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
     conn = db()
-    cur = conn.execute(
-        "SELECT address, min_usdc FROM watches WHERE chat_id=? ORDER BY address",
+    rows = conn.execute(
+        "SELECT address,min_usdc FROM watches WHERE chat_id=?",
         (chat_id,)
-    )
-    rows = cur.fetchall()
+    ).fetchall()
     conn.close()
 
     if not rows:
-        return await update.message.reply_text("Список пуст.")
+        return await update.message.reply_text("Пусто")
 
-    msg = ["📌 Отслеживаемые адреса:"]
-    for addr, min_usdc in rows:
-        msg.append(f"• {addr}  —  порог: {float(min_usdc)} USDC")
+    msg = []
+    for a,m in rows:
+        msg.append(f"{a} — {m} USDC")
 
     await update.message.reply_text("\n".join(msg))
 
-
-async def cmd_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /min <address> <amount>
-    if len(context.args) < 2:
-        return await update.message.reply_text("Пример: /min 0x1234... 10000")
-
-    addr = normalize(context.args[0])
-    if not ADDR_RE.match(addr):
-        return await update.message.reply_text("❌ Неверный формат адреса.")
-
-    try:
-        value = parse_amount(context.args[1])
-        if value < 0:
-            raise ValueError("negative")
-    except Exception:
-        return await update.message.reply_text("❌ Сумма должна быть числом. Пример: /min 0x1234... 10000")
-
-    chat_id = update.effective_chat.id
-
-    conn = db()
-    with conn:
-        # проверим, что адрес уже добавлен
-        cur = conn.execute(
-            "SELECT 1 FROM watches WHERE chat_id=? AND address=?",
-            (chat_id, addr)
-        )
-        if not cur.fetchone():
-            conn.close()
-            return await update.message.reply_text("Сначала добавь адрес: /watch 0x...")
-
-        conn.execute(
-            "UPDATE watches SET min_usdc=? WHERE chat_id=? AND address=?",
-            (float(value), chat_id, addr)
-        )
-    conn.close()
-
-    await update.message.reply_text(f"✅ Порог для {addr}: {float(value)} USDC")
-
-# ================= POLLING JOB =================
+# ================= POLL =================
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     conn = db()
-    cur = conn.execute("SELECT chat_id, address, last_seen_ts, min_usdc FROM watches")
-    watches = cur.fetchall()
+    rows = conn.execute(
+        "SELECT chat_id,address,last_seen_ts,min_usdc FROM watches"
+    ).fetchall()
 
-    for chat_id, addr, last_ts, min_usdc in watches:
+    for chat_id,addr,last_ts,min_usdc in rows:
         try:
             trades = fetch_latest_trades(addr)
-        except RuntimeError as e:
-            if str(e).startswith("RATE_LIMIT:"):
-                wait_s = int(str(e).split(":")[1])
-                log.warning("Rate limit, sleep %s sec", wait_s)
-                await asyncio.sleep(wait_s)
-            continue
-        except Exception as e:
-            log.warning("Fetch error: %s", e)
+        except:
             continue
 
-        # все новые сделки (для обновления last_seen_ts)
-        new_all = [
-            t for t in trades
-            if int(t.get("timestamp") or 0) > int(last_ts)
-        ]
-        if not new_all:
+        new=[t for t in trades if int(t.get("timestamp") or 0)>int(last_ts)]
+        if not new:
             continue
 
-        # обновим last_seen_ts по всем новым — чтобы мелочь не повторялась бесконечно
-        max_ts_all = max(int(t.get("timestamp") or 0) for t in new_all)
+        max_ts=max(int(t.get("timestamp") or 0) for t in new)
 
-        # алерт только по порогу этого адреса
-        new_alerts = [t for t in new_all if trade_usdc(t) >= float(min_usdc)]
+        for t in new:
+            if trade_usdc(t)<float(min_usdc):
+                continue
 
-        if new_alerts:
-            new_alerts.sort(key=lambda x: int(x.get("timestamp") or 0))
-            for t in new_alerts:
-                text = f"👤 `{addr}` (min {float(min_usdc)} USDC)\n" + format_trade(t)
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    parse_mode="Markdown"
-                )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"`{addr}`\n"+format_trade(t),
+                parse_mode="Markdown"
+            )
 
         with conn:
             conn.execute(
                 "UPDATE watches SET last_seen_ts=? WHERE chat_id=? AND address=?",
-                (max_ts_all, chat_id, addr)
+                (max_ts,chat_id,addr)
             )
 
     conn.close()
 
-# ================= START =================
+# ================= MAIN =================
 
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise SystemExit("❌ Вставь токен в BOT_TOKEN в начале файла.")
+    app=Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",cmd_start))
+    app.add_handler(CommandHandler("watch",cmd_watch))
+    app.add_handler(CommandHandler("min",cmd_min))
+    app.add_handler(CommandHandler("list",cmd_list))
 
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("watch", cmd_watch))
-    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("min", cmd_min))
-
-    app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL_SEC, first=3)
+    app.job_queue.run_repeating(poll_job,interval=POLL_INTERVAL_SEC,first=3)
 
     log.info("Bot started")
     app.run_polling()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
