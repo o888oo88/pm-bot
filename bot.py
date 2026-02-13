@@ -5,7 +5,12 @@ import sqlite3
 import requests
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,13 +33,16 @@ ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pm-bot")
 
-BOT_VERSION = "BUTTON_PANEL_v4_BACK_NAV"
+BOT_VERSION = "BUTTON_PANEL_v6_EDIT_LIST_ONE_MESSAGE"
 print("=== RUNNING:", BOT_VERSION, "DB:", DB_PATH, "===")
 
 # ====== состояния ввода ======
 WAITING_ADDR = "WAITING_ADDR"
 WAITING_MIN = "WAITING_MIN"
 PENDING_MIN_ADDR = "PENDING_MIN_ADDR"
+
+# message_id списка, чтобы обновлять его (на чат)
+LIST_MSG_ID = "LIST_MSG_ID"
 
 def reset_wait_states(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(WAITING_ADDR, None)
@@ -132,16 +140,16 @@ def format_trade_like_screenshot(addr: str, t: dict) -> str:
 
 # ================= UI =================
 
-def back_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")]
-    ])
-
 def panel_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Watch", callback_data="panel:watch")],
         [InlineKeyboardButton("📋 List", callback_data="panel:list")],
         [InlineKeyboardButton("🗑 Clear all", callback_data="panel:clear_confirm")],
+    ])
+
+def back_to_panel_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")]
     ])
 
 def clear_confirm_markup():
@@ -231,9 +239,9 @@ def clear_all(chat_id: int) -> int:
     conn.close()
     return int(deleted)
 
-# ================= LIST with inline buttons + BACK =================
+# ================= LIST SCREEN (build + render) =================
 
-async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+def build_list_screen(chat_id: int):
     conn = db()
     rows = conn.execute(
         "SELECT address, min_usdc, paused FROM watches WHERE chat_id=? ORDER BY address",
@@ -242,13 +250,11 @@ async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     if not rows:
-        return await context.bot.send_message(
-            chat_id=chat_id,
-            text="Список пуст.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")]
-            ])
-        )
+        text = "Список пуст."
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")]
+        ])
+        return text, markup
 
     text_lines = ["📌 Отслеживаемые адреса:"]
     buttons = []
@@ -264,16 +270,46 @@ async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Unwatch", callback_data=f"del:{addr}"),
         ])
 
-    # добавляем "Назад" отдельной строкой снизу
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")])
+    return "\n".join(text_lines), InlineKeyboardMarkup(buttons)
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="\n".join(text_lines),
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+async def show_list_screen(chat_id: int, context: ContextTypes.DEFAULT_TYPE, *, prefer_edit: bool = True, edit_from=None):
+    """
+    prefer_edit=True: пытаемся редактировать уже существующее сообщение списка
+    edit_from: callback_query.message (если вызвано из кнопок), тогда редактируем его в первую очередь
+    """
+    text, markup = build_list_screen(chat_id)
 
-# ================= CALLBACK BUTTONS =================
+    # 1) если пришло из callback — лучше редактировать текущее сообщение
+    if prefer_edit and edit_from is not None:
+        try:
+            await edit_from.edit_text(text=text, reply_markup=markup)
+            context.user_data[LIST_MSG_ID] = edit_from.message_id
+            return
+        except Exception:
+            pass
+
+    # 2) пробуем редактировать сохранённое сообщение списка
+    if prefer_edit:
+        mid = context.user_data.get(LIST_MSG_ID)
+        if mid:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=mid,
+                    text=text,
+                    reply_markup=markup
+                )
+                return
+            except Exception:
+                # если сообщение удалили/слишком старое — отправим новое
+                context.user_data.pop(LIST_MSG_ID, None)
+
+    # 3) отправляем новое и запоминаем message_id
+    msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+    context.user_data[LIST_MSG_ID] = msg.message_id
+
+# ================= CALLBACKS =================
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -281,63 +317,51 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     chat_id = q.message.chat.id
 
-    # Назад -> панель + сброс ожиданий
     if data == "nav:panel":
         reset_wait_states(context)
-        return await q.message.reply_text("Панель:", reply_markup=panel_markup())
+        await q.message.reply_text("Панель:", reply_markup=ReplyKeyboardRemove())
+        return await q.message.reply_text("Выбери действие:", reply_markup=panel_markup())
 
     if data == "panel:watch":
         reset_wait_states(context)
         context.user_data[WAITING_ADDR] = True
-        return await q.message.reply_text(
-            "Введи адрес 0x... (просто сообщением):",
-            reply_markup=back_markup()
-        )
+        return await q.message.reply_text("Введи адрес 0x... (просто сообщением):", reply_markup=back_to_panel_markup())
 
     if data == "panel:list":
         reset_wait_states(context)
-        return await send_list(chat_id, context)
+        # редактируем текущее (панельное) сообщение в список
+        return await show_list_screen(chat_id, context, prefer_edit=True, edit_from=q.message)
 
     if data == "panel:clear_confirm":
         reset_wait_states(context)
-        return await q.message.reply_text(
-            "Точно удалить ВСЕ адреса из этого чата?",
-            reply_markup=clear_confirm_markup()
-        )
+        return await q.message.reply_text("Точно удалить ВСЕ адреса из этого чата?", reply_markup=clear_confirm_markup())
 
     if data == "panel:clear_yes":
         reset_wait_states(context)
         n = clear_all(chat_id)
-        return await q.message.reply_text(f"🗑 Удалено адресов: {n}", reply_markup=panel_markup())
+        await q.message.reply_text(f"🗑 Удалено адресов: {n}")
+        await q.message.reply_text("Панель:", reply_markup=ReplyKeyboardRemove())
+        return await q.message.reply_text("Выбери действие:", reply_markup=panel_markup())
 
     if data.startswith("del:"):
         reset_wait_states(context)
         addr = data.split(":", 1)[1]
-        deleted = delete_watch(chat_id, addr)
-        return await q.edit_message_text(f"🛑 Удалил {addr}" if deleted else "Адрес не найден/уже удалён.")
+        delete_watch(chat_id, addr)
+        # обновим текущий экран списка (edit)
+        return await show_list_screen(chat_id, context, prefer_edit=True, edit_from=q.message)
 
     if data.startswith("pause:"):
         reset_wait_states(context)
         addr = data.split(":", 1)[1]
-        new_state = toggle_pause(chat_id, addr)
-        if new_state is None:
-            return await q.message.reply_text("Адрес не найден.", reply_markup=panel_markup())
-
-        await q.message.reply_text(
-            f"{'⏸ Пауза включена' if new_state else '▶️ Пауза снята'} для {addr}",
-            reply_markup=panel_markup()
-        )
-        return
+        toggle_pause(chat_id, addr)
+        return await show_list_screen(chat_id, context, prefer_edit=True, edit_from=q.message)
 
     if data.startswith("min:"):
         addr = data.split(":", 1)[1]
         reset_wait_states(context)
         context.user_data[WAITING_MIN] = True
         context.user_data[PENDING_MIN_ADDR] = addr
-        return await q.message.reply_text(
-            f"Введи новый min (USDC) для:\n{addr}\nНапример: 10000",
-            reply_markup=back_markup()
-        )
+        return await q.message.reply_text(f"Введи новый min (USDC) для:\n{addr}\nНапример: 10000", reply_markup=back_to_panel_markup())
 
 # ================= TEXT INPUT =================
 
@@ -347,89 +371,56 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get(WAITING_ADDR):
         addr = normalize(txt)
-        context.user_data[WAITING_ADDR] = False
 
         if not ADDR_RE.match(addr):
             context.user_data[WAITING_ADDR] = True
-            return await update.message.reply_text("❌ Неверный адрес. Введи 0x... ещё раз:", reply_markup=back_markup())
+            return await update.message.reply_text("❌ Неверный адрес. Введи 0x... ещё раз:", reply_markup=back_to_panel_markup())
 
+        context.user_data[WAITING_ADDR] = False
         await add_watch(chat_id, addr)
         reset_wait_states(context)
-        return await update.message.reply_text(f"✅ Добавил {addr}", reply_markup=panel_markup())
+
+        await update.message.reply_text(f"✅ Добавил {addr}")
+        # после добавления — сразу показываем список (в одном сообщении)
+        return await show_list_screen(chat_id, context, prefer_edit=True)
 
     if context.user_data.get(WAITING_MIN):
         addr = context.user_data.get(PENDING_MIN_ADDR)
         if not addr:
             reset_wait_states(context)
-            return await update.message.reply_text("Ошибка. Нажми 💰 Min заново в списке.", reply_markup=panel_markup())
+            return await update.message.reply_text("Ошибка. Нажми 💰 Min заново.", reply_markup=panel_markup())
 
         try:
             val = parse_amount(txt)
             if val < 0:
                 raise ValueError
         except Exception:
-            return await update.message.reply_text("❌ Введи число, например 10000", reply_markup=back_markup())
+            return await update.message.reply_text("❌ Введи число, например 10000", reply_markup=back_to_panel_markup())
 
-        ok = set_min(chat_id, addr, val)
+        set_min(chat_id, addr, val)
         reset_wait_states(context)
-        return await update.message.reply_text(
-            "✅ Порог обновлён" if ok else "Адрес не найден.",
-            reply_markup=panel_markup()
-        )
 
-# ================= Команды (опционально) =================
+        await update.message.reply_text("✅ Порог обновлён")
+        return await show_list_screen(chat_id, context, prefer_edit=True)
+
+# ================= COMMANDS =================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_wait_states(context)
-    await update.message.reply_text(
-        "✅ Панель управления",
-        reply_markup=panel_markup()
-    )
+    await update.message.reply_text("Панель:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("✅ Панель управления\nВыбери действие:", reply_markup=panel_markup())
 
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_wait_states(context)
-    await update.message.reply_text("Панель:", reply_markup=panel_markup())
+    await update.message.reply_text("Панель:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("Выбери действие:", reply_markup=panel_markup())
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Версия: {BOT_VERSION}\nDB: {DB_PATH}")
 
-async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Пример: /watch 0x1234...")
-    addr = normalize(context.args[0])
-    if not ADDR_RE.match(addr):
-        return await update.message.reply_text("❌ Неверный адрес.")
-    await add_watch(update.effective_chat.id, addr)
-    await update.message.reply_text(f"✅ Добавил {addr}", reply_markup=panel_markup())
-
-async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Пример: /unwatch 0x1234...")
-    addr = normalize(context.args[0])
-    deleted = delete_watch(update.effective_chat.id, addr)
-    await update.message.reply_text(f"🛑 Удалил {addr}" if deleted else "Адрес не найден.", reply_markup=panel_markup())
-
-async def cmd_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Пример: /min 0x1234... 10000")
-    addr = normalize(context.args[0])
-    if not ADDR_RE.match(addr):
-        return await update.message.reply_text("❌ Неверный адрес.")
-    try:
-        val = parse_amount(context.args[1])
-    except Exception:
-        return await update.message.reply_text("❌ Сумма должна быть числом.")
-    ok = set_min(update.effective_chat.id, addr, val)
-    await update.message.reply_text("✅ Порог обновлён" if ok else "Сначала добавь адрес: /watch 0x...", reply_markup=panel_markup())
-
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_wait_states(context)
-    await send_list(update.effective_chat.id, context)
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reset_wait_states(context)
-    n = clear_all(update.effective_chat.id)
-    await update.message.reply_text(f"🗑 Удалено адресов: {n}", reply_markup=panel_markup())
+    await show_list_screen(update.effective_chat.id, context, prefer_edit=True)
 
 # ================= POLL =================
 
@@ -489,23 +480,14 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("version", cmd_version))
-    app.add_handler(CommandHandler("watch", cmd_watch))
-    app.add_handler(CommandHandler("unwatch", cmd_unwatch))
-    app.add_handler(CommandHandler("min", cmd_min))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("clear", cmd_clear))
 
-    # inline кнопки
     app.add_handler(CallbackQueryHandler(on_button))
-
-    # ввод текста (адрес / min)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # polling
     app.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL_SEC, first=3)
 
     log.info("Bot started")
