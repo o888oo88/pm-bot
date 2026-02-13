@@ -28,13 +28,18 @@ ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pm-bot")
 
-BOT_VERSION = "BUTTON_PANEL_v3_PER_ADDRESS_PAUSE"
+BOT_VERSION = "BUTTON_PANEL_v4_BACK_NAV"
 print("=== RUNNING:", BOT_VERSION, "DB:", DB_PATH, "===")
 
 # ====== состояния ввода ======
 WAITING_ADDR = "WAITING_ADDR"
 WAITING_MIN = "WAITING_MIN"
 PENDING_MIN_ADDR = "PENDING_MIN_ADDR"
+
+def reset_wait_states(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(WAITING_ADDR, None)
+    context.user_data.pop(WAITING_MIN, None)
+    context.user_data.pop(PENDING_MIN_ADDR, None)
 
 # ================= БАЗА =================
 
@@ -50,7 +55,6 @@ def db():
             PRIMARY KEY (chat_id, address)
         )
     """)
-    # миграция, если paused не было
     cols = [r[1] for r in conn.execute("PRAGMA table_info(watches)").fetchall()]
     if "paused" not in cols:
         conn.execute("ALTER TABLE watches ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
@@ -102,7 +106,7 @@ def polymarket_url(t: dict):
         return f"https://polymarket.com/event/{e}"
     return None
 
-# ================= ФОРМАТ СООБЩЕНИЯ (как на скрине) =================
+# ================= ФОРМАТ (как на скрине) =================
 
 def format_trade_like_screenshot(addr: str, t: dict) -> str:
     title = t.get("title") or "(без названия)"
@@ -128,6 +132,11 @@ def format_trade_like_screenshot(addr: str, t: dict) -> str:
 
 # ================= UI =================
 
+def back_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")]
+    ])
+
 def panel_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Watch", callback_data="panel:watch")],
@@ -138,7 +147,7 @@ def panel_markup():
 def clear_confirm_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Да, удалить всё", callback_data="panel:clear_yes")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="panel:clear_no")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="nav:panel")],
     ])
 
 # ================= DB helpers =================
@@ -197,7 +206,6 @@ def set_min(chat_id: int, addr: str, val: float) -> bool:
     return True
 
 def toggle_pause(chat_id: int, addr: str) -> bool | None:
-    """Возвращает новое состояние paused (True/False) или None если адрес не найден."""
     conn = db()
     with conn:
         row = conn.execute(
@@ -223,7 +231,7 @@ def clear_all(chat_id: int) -> int:
     conn.close()
     return int(deleted)
 
-# ================= LIST with inline buttons =================
+# ================= LIST with inline buttons + BACK =================
 
 async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
@@ -237,7 +245,9 @@ async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         return await context.bot.send_message(
             chat_id=chat_id,
             text="Список пуст.",
-            reply_markup=panel_markup()
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")]
+            ])
         )
 
     text_lines = ["📌 Отслеживаемые адреса:"]
@@ -254,6 +264,9 @@ async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Unwatch", callback_data=f"del:{addr}"),
         ])
 
+    # добавляем "Назад" отдельной строкой снизу
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:panel")])
+
     await context.bot.send_message(
         chat_id=chat_id,
         text="\n".join(text_lines),
@@ -268,45 +281,63 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     chat_id = q.message.chat.id
 
+    # Назад -> панель + сброс ожиданий
+    if data == "nav:panel":
+        reset_wait_states(context)
+        return await q.message.reply_text("Панель:", reply_markup=panel_markup())
+
     if data == "panel:watch":
+        reset_wait_states(context)
         context.user_data[WAITING_ADDR] = True
-        context.user_data[WAITING_MIN] = False
-        context.user_data.pop(PENDING_MIN_ADDR, None)
-        return await q.message.reply_text("Введи адрес 0x... (просто сообщением):")
+        return await q.message.reply_text(
+            "Введи адрес 0x... (просто сообщением):",
+            reply_markup=back_markup()
+        )
 
     if data == "panel:list":
+        reset_wait_states(context)
         return await send_list(chat_id, context)
 
     if data == "panel:clear_confirm":
-        return await q.message.reply_text("Точно удалить ВСЕ адреса из этого чата?", reply_markup=clear_confirm_markup())
+        reset_wait_states(context)
+        return await q.message.reply_text(
+            "Точно удалить ВСЕ адреса из этого чата?",
+            reply_markup=clear_confirm_markup()
+        )
 
     if data == "panel:clear_yes":
+        reset_wait_states(context)
         n = clear_all(chat_id)
         return await q.message.reply_text(f"🗑 Удалено адресов: {n}", reply_markup=panel_markup())
 
-    if data == "panel:clear_no":
-        return await q.message.reply_text("Ок, не удаляю.", reply_markup=panel_markup())
-
     if data.startswith("del:"):
+        reset_wait_states(context)
         addr = data.split(":", 1)[1]
         deleted = delete_watch(chat_id, addr)
         return await q.edit_message_text(f"🛑 Удалил {addr}" if deleted else "Адрес не найден/уже удалён.")
 
     if data.startswith("pause:"):
+        reset_wait_states(context)
         addr = data.split(":", 1)[1]
         new_state = toggle_pause(chat_id, addr)
         if new_state is None:
-            return await q.message.reply_text("Адрес не найден.")
-        # покажем обновлённый список
-        await q.message.reply_text(f"{'⏸ Пауза включена' if new_state else '▶️ Пауза снята'} для {addr}")
-        return await send_list(chat_id, context)
+            return await q.message.reply_text("Адрес не найден.", reply_markup=panel_markup())
+
+        await q.message.reply_text(
+            f"{'⏸ Пауза включена' if new_state else '▶️ Пауза снята'} для {addr}",
+            reply_markup=panel_markup()
+        )
+        return
 
     if data.startswith("min:"):
         addr = data.split(":", 1)[1]
+        reset_wait_states(context)
         context.user_data[WAITING_MIN] = True
         context.user_data[PENDING_MIN_ADDR] = addr
-        context.user_data[WAITING_ADDR] = False
-        return await q.message.reply_text(f"Введи новый min (USDC) для:\n{addr}\nНапример: 10000")
+        return await q.message.reply_text(
+            f"Введи новый min (USDC) для:\n{addr}\nНапример: 10000",
+            reply_markup=back_markup()
+        )
 
 # ================= TEXT INPUT =================
 
@@ -317,37 +348,46 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get(WAITING_ADDR):
         addr = normalize(txt)
         context.user_data[WAITING_ADDR] = False
+
         if not ADDR_RE.match(addr):
-            return await update.message.reply_text("❌ Неверный адрес. Введи 0x... ещё раз:")
+            context.user_data[WAITING_ADDR] = True
+            return await update.message.reply_text("❌ Неверный адрес. Введи 0x... ещё раз:", reply_markup=back_markup())
+
         await add_watch(chat_id, addr)
+        reset_wait_states(context)
         return await update.message.reply_text(f"✅ Добавил {addr}", reply_markup=panel_markup())
 
     if context.user_data.get(WAITING_MIN):
         addr = context.user_data.get(PENDING_MIN_ADDR)
         if not addr:
-            context.user_data[WAITING_MIN] = False
-            return await update.message.reply_text("Ошибка. Нажми 💰 Min заново в списке.")
+            reset_wait_states(context)
+            return await update.message.reply_text("Ошибка. Нажми 💰 Min заново в списке.", reply_markup=panel_markup())
+
         try:
             val = parse_amount(txt)
             if val < 0:
                 raise ValueError
         except Exception:
-            return await update.message.reply_text("❌ Введи число, например 10000")
+            return await update.message.reply_text("❌ Введи число, например 10000", reply_markup=back_markup())
 
         ok = set_min(chat_id, addr, val)
-        context.user_data[WAITING_MIN] = False
-        context.user_data.pop(PENDING_MIN_ADDR, None)
-        return await update.message.reply_text("✅ Порог обновлён" if ok else "Адрес не найден.", reply_markup=panel_markup())
+        reset_wait_states(context)
+        return await update.message.reply_text(
+            "✅ Порог обновлён" if ok else "Адрес не найден.",
+            reply_markup=panel_markup()
+        )
 
 # ================= Команды (опционально) =================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_wait_states(context)
     await update.message.reply_text(
-        f"Выбери действие",
+        "✅ Панель управления",
         reply_markup=panel_markup()
     )
 
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_wait_states(context)
     await update.message.reply_text("Панель:", reply_markup=panel_markup())
 
 async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -383,9 +423,11 @@ async def cmd_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Порог обновлён" if ok else "Сначала добавь адрес: /watch 0x...", reply_markup=panel_markup())
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_wait_states(context)
     await send_list(update.effective_chat.id, context)
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_wait_states(context)
     n = clear_all(update.effective_chat.id)
     await update.message.reply_text(f"🗑 Удалено адресов: {n}", reply_markup=panel_markup())
 
@@ -399,7 +441,6 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
     for chat_id, addr, last_ts, min_usdc, paused in rows:
-        # пауза по адресу
         if int(paused) == 1:
             continue
 
@@ -472,5 +513,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
