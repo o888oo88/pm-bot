@@ -343,7 +343,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"✅ Панель управления\nВерсия: {BOT_VERSION}",
+        f"Выбери действие: {BOT_VERSION}",
         reply_markup=panel_markup()
     )
 
@@ -472,3 +472,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
