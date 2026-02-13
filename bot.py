@@ -28,7 +28,7 @@ ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pm-bot")
 
-BOT_VERSION = "BUTTON_PANEL_v2_PAUSE_CLEAR_FORMAT"
+BOT_VERSION = "BUTTON_PANEL_v3_PER_ADDRESS_PAUSE"
 print("=== RUNNING:", BOT_VERSION, "DB:", DB_PATH, "===")
 
 # ====== состояния ввода ======
@@ -46,15 +46,14 @@ def db():
             address TEXT NOT NULL,
             last_seen_ts INTEGER NOT NULL DEFAULT 0,
             min_usdc REAL NOT NULL DEFAULT 0,
+            paused INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (chat_id, address)
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chat_settings (
-            chat_id INTEGER PRIMARY KEY,
-            paused INTEGER NOT NULL DEFAULT 0
-        )
-    """)
+    # миграция, если paused не было
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(watches)").fetchall()]
+    if "paused" not in cols:
+        conn.execute("ALTER TABLE watches ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
     return conn
 
 
@@ -122,42 +121,17 @@ def format_trade_like_screenshot(addr: str, t: dict) -> str:
 
     url = polymarket_url(t)
     if url:
-        # Чтобы Telegram делал превью, лучше иметь URL в тексте.
-        # Делаем "Открыть событие" + URL на следующей строке.
         lines.append("🌐 Открыть событие")
         lines.append(url)
 
     return "\n".join(lines)
 
-# ================= НАСТРОЙКИ ЧАТА (PAUSE) =================
-
-def get_paused(chat_id: int) -> bool:
-    conn = db()
-    row = conn.execute("SELECT paused FROM chat_settings WHERE chat_id=?", (chat_id,)).fetchone()
-    conn.close()
-    return bool(row[0]) if row else False
-
-
-def set_paused(chat_id: int, paused: bool):
-    conn = db()
-    with conn:
-        conn.execute(
-            "INSERT INTO chat_settings(chat_id, paused) VALUES(?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET paused=excluded.paused",
-            (chat_id, 1 if paused else 0)
-        )
-    conn.close()
-
 # ================= UI =================
 
-def panel_markup(chat_id: int):
-    paused = get_paused(chat_id)
-    pause_text = "▶️ Resume alerts" if paused else "⏸ Pause alerts"
-
+def panel_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Watch", callback_data="panel:watch")],
         [InlineKeyboardButton("📋 List", callback_data="panel:list")],
-        [InlineKeyboardButton(pause_text, callback_data="panel:pause")],
         [InlineKeyboardButton("🗑 Clear all", callback_data="panel:clear_confirm")],
     ])
 
@@ -166,66 +140,6 @@ def clear_confirm_markup():
         [InlineKeyboardButton("✅ Да, удалить всё", callback_data="panel:clear_yes")],
         [InlineKeyboardButton("❌ Отмена", callback_data="panel:clear_no")],
     ])
-
-# ================= КОМАНДЫ =================
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        f"✅ Панель управления\nВерсия: {BOT_VERSION}",
-        reply_markup=panel_markup(chat_id)
-    )
-
-async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await update.message.reply_text("Панель:", reply_markup=panel_markup(chat_id))
-
-async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Версия: {BOT_VERSION}\nDB: {DB_PATH}")
-
-# Команды тоже оставим
-async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Пример: /watch 0x1234...")
-    addr = normalize(context.args[0])
-    if not ADDR_RE.match(addr):
-        return await update.message.reply_text("❌ Неверный адрес.")
-    await add_watch(update.effective_chat.id, addr)
-    await update.message.reply_text(f"✅ Добавил {addr}")
-
-async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        return await update.message.reply_text("Пример: /unwatch 0x1234...")
-    addr = normalize(context.args[0])
-    deleted = delete_watch(update.effective_chat.id, addr)
-    await update.message.reply_text(f"🛑 Удалил {addr}" if deleted else "Адрес не найден.")
-
-async def cmd_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("Пример: /min 0x1234... 10000")
-    addr = normalize(context.args[0])
-    if not ADDR_RE.match(addr):
-        return await update.message.reply_text("❌ Неверный адрес.")
-    try:
-        val = parse_amount(context.args[1])
-    except Exception:
-        return await update.message.reply_text("❌ Сумма должна быть числом.")
-    ok = set_min(update.effective_chat.id, addr, val)
-    await update.message.reply_text("✅ Порог обновлён" if ok else "Сначала добавь адрес: /watch 0x...")
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_list(update.effective_chat.id, context)
-
-async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    paused = get_paused(chat_id)
-    set_paused(chat_id, not paused)
-    await update.message.reply_text("⏸ Пауза включена" if not paused else "▶️ Пауза снята")
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    n = clear_all(chat_id)
-    await update.message.reply_text(f"🗑 Удалено адресов: {n}")
 
 # ================= DB helpers =================
 
@@ -241,15 +155,16 @@ async def add_watch(chat_id: int, addr: str):
     conn = db()
     with conn:
         cur = conn.execute(
-            "SELECT min_usdc FROM watches WHERE chat_id=? AND address=?",
+            "SELECT min_usdc, paused FROM watches WHERE chat_id=? AND address=?",
             (chat_id, addr)
         )
         row = cur.fetchone()
         old_min = float(row[0]) if row else 0.0
+        old_paused = int(row[1]) if row else 0
 
         conn.execute(
-            "INSERT OR REPLACE INTO watches(chat_id, address, last_seen_ts, min_usdc) VALUES(?,?,?,?)",
-            (chat_id, addr, last_seen_ts, old_min)
+            "INSERT OR REPLACE INTO watches(chat_id, address, last_seen_ts, min_usdc, paused) VALUES(?,?,?,?,?)",
+            (chat_id, addr, last_seen_ts, old_min, old_paused)
         )
     conn.close()
 
@@ -281,6 +196,25 @@ def set_min(chat_id: int, addr: str, val: float) -> bool:
     conn.close()
     return True
 
+def toggle_pause(chat_id: int, addr: str) -> bool | None:
+    """Возвращает новое состояние paused (True/False) или None если адрес не найден."""
+    conn = db()
+    with conn:
+        row = conn.execute(
+            "SELECT paused FROM watches WHERE chat_id=? AND address=?",
+            (chat_id, addr)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return None
+        new_val = 0 if int(row[0]) else 1
+        conn.execute(
+            "UPDATE watches SET paused=? WHERE chat_id=? AND address=?",
+            (new_val, chat_id, addr)
+        )
+    conn.close()
+    return bool(new_val)
+
 def clear_all(chat_id: int) -> int:
     conn = db()
     with conn:
@@ -294,7 +228,7 @@ def clear_all(chat_id: int) -> int:
 async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     rows = conn.execute(
-        "SELECT address, min_usdc FROM watches WHERE chat_id=? ORDER BY address",
+        "SELECT address, min_usdc, paused FROM watches WHERE chat_id=? ORDER BY address",
         (chat_id,)
     ).fetchall()
     conn.close()
@@ -303,15 +237,19 @@ async def send_list(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         return await context.bot.send_message(
             chat_id=chat_id,
             text="Список пуст.",
-            reply_markup=panel_markup(chat_id)
+            reply_markup=panel_markup()
         )
 
     text_lines = ["📌 Отслеживаемые адреса:"]
     buttons = []
 
-    for addr, min_usdc in rows:
-        text_lines.append(f"• {addr} — min {float(min_usdc)} USDC")
+    for addr, min_usdc, paused in rows:
+        status = "⏸ paused" if int(paused) else "▶️ active"
+        text_lines.append(f"• {addr} — min {float(min_usdc)} USDC — {status}")
+
+        pause_btn = InlineKeyboardButton(("▶️ Resume" if int(paused) else "⏸ Pause"), callback_data=f"pause:{addr}")
         buttons.append([
+            pause_btn,
             InlineKeyboardButton("💰 Min", callback_data=f"min:{addr}"),
             InlineKeyboardButton("❌ Unwatch", callback_data=f"del:{addr}"),
         ])
@@ -339,26 +277,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "panel:list":
         return await send_list(chat_id, context)
 
-    if data == "panel:pause":
-        paused = get_paused(chat_id)
-        set_paused(chat_id, not paused)
-        txt = "⏸ Пауза включена (алерты не будут приходить)" if not paused else "▶️ Пауза снята (алерты снова идут)"
-        return await q.message.reply_text(txt, reply_markup=panel_markup(chat_id))
-
     if data == "panel:clear_confirm":
         return await q.message.reply_text("Точно удалить ВСЕ адреса из этого чата?", reply_markup=clear_confirm_markup())
 
     if data == "panel:clear_yes":
         n = clear_all(chat_id)
-        return await q.message.reply_text(f"🗑 Удалено адресов: {n}", reply_markup=panel_markup(chat_id))
+        return await q.message.reply_text(f"🗑 Удалено адресов: {n}", reply_markup=panel_markup())
 
     if data == "panel:clear_no":
-        return await q.message.reply_text("Ок, не удаляю.", reply_markup=panel_markup(chat_id))
+        return await q.message.reply_text("Ок, не удаляю.", reply_markup=panel_markup())
 
     if data.startswith("del:"):
         addr = data.split(":", 1)[1]
         deleted = delete_watch(chat_id, addr)
         return await q.edit_message_text(f"🛑 Удалил {addr}" if deleted else "Адрес не найден/уже удалён.")
+
+    if data.startswith("pause:"):
+        addr = data.split(":", 1)[1]
+        new_state = toggle_pause(chat_id, addr)
+        if new_state is None:
+            return await q.message.reply_text("Адрес не найден.")
+        # покажем обновлённый список
+        await q.message.reply_text(f"{'⏸ Пауза включена' if new_state else '▶️ Пауза снята'} для {addr}")
+        return await send_list(chat_id, context)
 
     if data.startswith("min:"):
         addr = data.split(":", 1)[1]
@@ -379,7 +320,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ADDR_RE.match(addr):
             return await update.message.reply_text("❌ Неверный адрес. Введи 0x... ещё раз:")
         await add_watch(chat_id, addr)
-        return await update.message.reply_text(f"✅ Добавил {addr}", reply_markup=panel_markup(chat_id))
+        return await update.message.reply_text(f"✅ Добавил {addr}", reply_markup=panel_markup())
 
     if context.user_data.get(WAITING_MIN):
         addr = context.user_data.get(PENDING_MIN_ADDR)
@@ -388,26 +329,78 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text("Ошибка. Нажми 💰 Min заново в списке.")
         try:
             val = parse_amount(txt)
+            if val < 0:
+                raise ValueError
         except Exception:
             return await update.message.reply_text("❌ Введи число, например 10000")
 
         ok = set_min(chat_id, addr, val)
         context.user_data[WAITING_MIN] = False
         context.user_data.pop(PENDING_MIN_ADDR, None)
-        return await update.message.reply_text("✅ Порог обновлён" if ok else "Адрес не найден.", reply_markup=panel_markup(chat_id))
+        return await update.message.reply_text("✅ Порог обновлён" if ok else "Адрес не найден.", reply_markup=panel_markup())
+
+# ================= Команды (опционально) =================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"✅ Панель управления\nВерсия: {BOT_VERSION}",
+        reply_markup=panel_markup()
+    )
+
+async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Панель:", reply_markup=panel_markup())
+
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Версия: {BOT_VERSION}\nDB: {DB_PATH}")
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Пример: /watch 0x1234...")
+    addr = normalize(context.args[0])
+    if not ADDR_RE.match(addr):
+        return await update.message.reply_text("❌ Неверный адрес.")
+    await add_watch(update.effective_chat.id, addr)
+    await update.message.reply_text(f"✅ Добавил {addr}", reply_markup=panel_markup())
+
+async def cmd_unwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Пример: /unwatch 0x1234...")
+    addr = normalize(context.args[0])
+    deleted = delete_watch(update.effective_chat.id, addr)
+    await update.message.reply_text(f"🛑 Удалил {addr}" if deleted else "Адрес не найден.", reply_markup=panel_markup())
+
+async def cmd_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text("Пример: /min 0x1234... 10000")
+    addr = normalize(context.args[0])
+    if not ADDR_RE.match(addr):
+        return await update.message.reply_text("❌ Неверный адрес.")
+    try:
+        val = parse_amount(context.args[1])
+    except Exception:
+        return await update.message.reply_text("❌ Сумма должна быть числом.")
+    ok = set_min(update.effective_chat.id, addr, val)
+    await update.message.reply_text("✅ Порог обновлён" if ok else "Сначала добавь адрес: /watch 0x...", reply_markup=panel_markup())
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_list(update.effective_chat.id, context)
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = clear_all(update.effective_chat.id)
+    await update.message.reply_text(f"🗑 Удалено адресов: {n}", reply_markup=panel_markup())
 
 # ================= POLL =================
 
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     rows = conn.execute(
-        "SELECT chat_id, address, last_seen_ts, min_usdc FROM watches"
+        "SELECT chat_id, address, last_seen_ts, min_usdc, paused FROM watches"
     ).fetchall()
     conn.close()
 
-    for chat_id, addr, last_ts, min_usdc in rows:
-        # Пауза на чат
-        if get_paused(chat_id):
+    for chat_id, addr, last_ts, min_usdc, paused in rows:
+        # пауза по адресу
+        if int(paused) == 1:
             continue
 
         try:
@@ -428,7 +421,6 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
 
         max_ts_all = max(int(t.get("timestamp") or 0) for t in new_all)
 
-        # слать только если >= min_usdc
         for t in sorted(new_all, key=lambda x: int(x.get("timestamp") or 0)):
             if trade_usdc(t) < float(min_usdc):
                 continue
@@ -437,10 +429,9 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=msg,
-                disable_web_page_preview=False  # важно для превью
+                disable_web_page_preview=False
             )
 
-        # обновляем last_seen по всем новым
         conn2 = db()
         with conn2:
             conn2.execute(
@@ -457,19 +448,17 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("version", cmd_version))
-
-    # команды (опционально)
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("unwatch", cmd_unwatch))
     app.add_handler(CommandHandler("min", cmd_min))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("clear", cmd_clear))
 
-    # кнопки
+    # inline кнопки
     app.add_handler(CallbackQueryHandler(on_button))
 
     # ввод текста (адрес / min)
